@@ -49,6 +49,7 @@ def main():
         db.close()
 
     print("\n" + "="*60)
+    print(f"   Topic list:")
     print("DONE!")
     print("="*60)
 

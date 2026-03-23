@@ -2,8 +2,9 @@ from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
+from utils.recommender import QuestionRecommender
 from datetime import timedelta
-from typing import List
+from typing import Optional, List
 
 # Import our modules
 from config import get_settings
@@ -227,10 +228,10 @@ def create_question(
 
     return new_question
 
-@app.get("/api/questions", response_model=List[QuestionForStudent])
+@app.get("/api/questions/next", response_model=List[QuestionForStudent])
 def get_questions(
-    topic: str = None,
-    difficulty: int = None,
+    topic: str = 0,
+    difficulty: int = 0,
     limit: int = 10,
     db: Session = Depends(get_db),
     current_student: Student = Depends(get_current_student)
@@ -429,3 +430,98 @@ def health_check():
     }
 
 # Run with: uvicorn main:app --reload
+
+# ===== QUESTION RECOMMENDATION ENDPOINTS =====
+
+@app.get("/api/questions/next", response_model=QuestionForStudent)
+def get_next_question(
+    topic: Optional[str] = None,
+    db: Session = Depends(get_db),
+    current_student: Student = Depends(get_current_student)
+):
+    """
+    Get next recommended question for the student
+
+    - Considers student's knowledge state
+    - Recommends appropriate difficulty
+    - Prioritizes weak areas
+    - Avoids recently answered questions
+    """
+    recommender = QuestionRecommender(db)
+    question = recommender.get_next_question(current_student.id, topic)
+
+    if not question:
+        raise HTTPException(
+            status_code=404,
+            detail="No suitable questions found. Try a different topic."
+        )
+
+    return question
+
+@app.get("/api/recommendations/topics")
+def get_topic_recommendations(
+    limit: int = 3,
+    db: Session = Depends(get_db),
+    current_student: Student = Depends(get_current_student)
+):
+    """
+    Get recommended topics for student to practice
+
+    Returns topics ordered by priority (weakest areas first)
+    """
+    recommender = QuestionRecommender(db)
+    recommendations = recommender.get_recommended_topics(current_student.id, limit)
+
+    return {
+        "student_id": current_student.id,
+        "recommendations": recommendations
+    }
+
+@app.get("/api/students/{student_id}/stats")
+def get_student_stats(
+    student_id: int,
+    db: Session = Depends(get_db),
+    current_student: Student = Depends(get_current_student)
+):
+    """
+    Get overall statistics for a student
+    """
+    # Authorization check
+    if current_student.id != student_id and not current_student.is_teacher:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    # Get all interactions
+    interactions = db.query(Interaction).filter(
+        Interaction.student_id == student_id
+    ).all()
+
+    total_questions = len(interactions)
+    correct_answers = sum(1 for i in interactions if i.is_correct)
+    accuracy = (correct_answers / total_questions * 100) if total_questions > 0 else 0
+
+    # Get knowledge states
+    knowledge_states = db.query(KnowledgeState).filter(
+        KnowledgeState.student_id == student_id
+    ).all()
+
+    topics_mastered = sum(1 for ks in knowledge_states if ks.mastery_level >= 0.8)
+    topics_in_progress = sum(1 for ks in knowledge_states if 0.4 <= ks.mastery_level < 0.8)
+    topics_struggling = sum(1 for ks in knowledge_states if ks.mastery_level < 0.4)
+
+    return {
+        "student_id": student_id,
+        "total_questions": total_questions,
+        "correct_answers": correct_answers,
+        "accuracy": round(accuracy, 2),
+        "topics_mastered": topics_mastered,
+        "topics_in_progress": topics_in_progress,
+        "topics_struggling": topics_struggling,
+        "knowledge_states": [
+            {
+                "topic": ks.topic,
+                "mastery_level": round(ks.mastery_level, 2),
+                "accuracy": round(ks.accuracy, 2)
+            }
+            for ks in knowledge_states
+        ]
+    }
