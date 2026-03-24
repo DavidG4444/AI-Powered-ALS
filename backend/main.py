@@ -2,7 +2,12 @@ from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
+from sqlalchemy import and_
 from utils.recommender import QuestionRecommender
+from ai.groq_client import groq_client
+from ml_models.knowledge_tracker import knowledge_tracker
+from ml_models.difficulty_adapter import difficulty_adapter
+from ml_models.learning_path import learning_path_generator
 from datetime import timedelta
 from typing import Optional, List
 
@@ -342,11 +347,15 @@ def submit_answer(
         )
         db.add(knowledge_state)
 
+    # Ensure fields are never None for math operations
+    knowledge_state.total_attempts = (knowledge_state.total_attempts or 0) + 1
+    knowledge_state.correct_attempts = knowledge_state.correct_attempts or 0
+    knowledge_state.consecutive_correct = knowledge_state.consecutive_correct or 0
+    knowledge_state.consecutive_wrong = knowledge_state.consecutive_wrong or 0
+    knowledge_state.mastery_level = knowledge_state.mastery_level if knowledge_state.mastery_level is not None else 0.5
+
     # Store old mastery for calculating change
     old_mastery = knowledge_state.mastery_level
-
-    # Update knowledge state (simple version - will enhance with ML in Day 3)
-    knowledge_state.total_attempts += 1
 
     if is_correct:
         knowledge_state.correct_attempts += 1
@@ -524,4 +533,274 @@ def get_student_stats(
             }
             for ks in knowledge_states
         ]
+    }
+@app.post("/api/submit-answer", response_model=AnswerResponse)
+def submit_answer(
+    submission: AnswerSubmission,
+    db: Session = Depends(get_db),
+    current_student: Student = Depends(get_current_student)
+):
+    """
+    Submit answer with AI-powered feedback and ML-based knowledge tracking
+    """
+    if submission.student_id != current_student.id:
+        raise HTTPException(status_code=403, detail="Cannot submit for another student")
+
+    # Get question
+    question = db.query(Question).filter(Question.id == submission.question_id).first()
+    if not question:
+        raise HTTPException(status_code=404, detail="Question not found")
+
+    is_correct = submission.answer_given == question.correct_answer
+
+    # Update question statistics
+    question.times_asked += 1
+    if is_correct:
+        question.times_correct += 1
+
+    # Generate AI explanation if wrong
+    ai_explanation = None
+    if not is_correct:
+        try:
+            ai_explanation = groq_client.generate_explanation(
+                question_text=question.question_text,
+                correct_answer=question.correct_answer,
+                student_answer=submission.answer_given,
+                topic=question.topic,
+                explanation=question.explanation
+            )
+        except Exception as e:
+            print(f"AI explanation error: {e}")
+            ai_explanation = question.explanation
+
+    # Record interaction
+    interaction = Interaction(
+        student_id=submission.student_id,
+        question_id=submission.question_id,
+        answer_given=submission.answer_given,
+        is_correct=is_correct,
+        time_taken_seconds=submission.time_taken_seconds,
+        ai_explanation=ai_explanation
+    )
+    db.add(interaction)
+
+    # Get or create knowledge state
+    knowledge_state = db.query(KnowledgeState).filter(
+        KnowledgeState.student_id == submission.student_id,
+        KnowledgeState.topic == question.topic
+    ).first()
+
+    if not knowledge_state:
+        knowledge_state = KnowledgeState(
+            student_id=submission.student_id,
+            topic=question.topic,
+            mastery_level=knowledge_tracker.initialize_knowledge()
+        )
+        db.add(knowledge_state)
+
+    # Ensure fields are never None for math operations
+    knowledge_state.total_attempts = (knowledge_state.total_attempts or 0)
+    knowledge_state.correct_attempts = knowledge_state.correct_attempts or 0
+    knowledge_state.consecutive_correct = knowledge_state.consecutive_correct or 0
+    knowledge_state.consecutive_wrong = knowledge_state.consecutive_wrong or 0
+    knowledge_state.mastery_level = knowledge_state.mastery_level if knowledge_state.mastery_level is not None else 0.5
+
+    # Store old mastery
+    old_mastery = knowledge_state.mastery_level
+
+    # Update using Bayesian Knowledge Tracking
+    new_mastery = knowledge_tracker.update_knowledge(
+        current_mastery=old_mastery,
+        is_correct=is_correct,
+        difficulty=question.difficulty
+    )
+
+    # Update knowledge state
+    knowledge_state.mastery_level = new_mastery
+    knowledge_state.total_attempts += 1
+
+    if is_correct:
+        knowledge_state.correct_attempts += 1
+        knowledge_state.consecutive_correct += 1
+        knowledge_state.consecutive_wrong = 0
+    else:
+        knowledge_state.consecutive_wrong += 1
+        knowledge_state.consecutive_correct = 0
+        knowledge_state.needs_review = new_mastery < 0.6
+
+    mastery_change = new_mastery - old_mastery
+
+    db.commit()
+
+    # Prepare response
+    response = AnswerResponse(
+        correct=is_correct,
+        correct_answer=question.correct_answer if not is_correct else None,
+        explanation=question.explanation if not is_correct else None,
+        ai_explanation=ai_explanation,
+        new_mastery_level=new_mastery,
+        mastery_change=mastery_change,
+        needs_review=knowledge_state.needs_review
+    )
+
+    return response
+
+# ===== AI-POWERED ENDPOINTS =====
+
+@app.get("/api/questions/{question_id}/hint")
+def get_question_hint(
+    question_id: int,
+    db: Session = Depends(get_db),
+    current_student: Student = Depends(get_current_student)
+):
+    """
+    Get an AI-generated hint for a question (without revealing answer)
+    """
+    question = db.query(Question).filter(Question.id == question_id).first()
+    if not question:
+        raise HTTPException(status_code=404, detail="Question not found")
+
+    try:
+        hint = groq_client.generate_hint(
+            question_text=question.question_text,
+            topic=question.topic,
+            difficulty=question.difficulty
+        )
+        return {"question_id": question_id, "hint": hint}
+    except Exception as e:
+        return {"question_id": question_id, "hint": "Think about the key concepts and try to eliminate wrong answers."}
+
+@app.get("/api/students/{student_id}/learning-path")
+def get_learning_path(
+    student_id: int,
+    time_available: Optional[int] = None,
+    db: Session = Depends(get_db),
+    current_student: Student = Depends(get_current_student)
+):
+    """
+    Generate personalized learning path
+
+    Args:
+        student_id: Student ID
+        time_available: Optional time constraint in minutes
+    """
+    if current_student.id != student_id and not current_student.is_teacher:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    # Get knowledge states
+    knowledge_states = db.query(KnowledgeState).filter(
+        KnowledgeState.student_id == student_id
+    ).all()
+
+    # Convert to dict
+    mastery_dict = {ks.topic: ks.mastery_level for ks in knowledge_states}
+
+    # Get all available topics
+    all_topics = db.query(Question.topic).distinct().all()
+    available_topics = [t[0] for t in all_topics]
+
+    # Generate path
+    path = learning_path_generator.generate_path(
+        knowledge_states=mastery_dict,
+        available_topics=available_topics,
+        time_available_minutes=time_available,
+        focus_weak_areas=True
+    )
+
+    return {
+        "student_id": student_id,
+        "path": [
+            {
+                "topic": step.topic,
+                "difficulty": step.difficulty,
+                "estimated_questions": step.estimated_questions,
+                "estimated_time_minutes": step.estimated_time_minutes,
+                "current_mastery": round(step.current_mastery, 2),
+                "target_mastery": round(step.target_mastery, 2),
+                "priority": step.priority,
+                "reason": step.reason
+            }
+            for step in path
+        ]
+    }
+
+@app.get("/api/students/{student_id}/study-tips")
+def get_study_tips(
+    student_id: int,
+    db: Session = Depends(get_db),
+    current_student: Student = Depends(get_current_student)
+):
+    """
+    Get AI-generated study tips based on weak areas
+    """
+    if current_student.id != student_id and not current_student.is_teacher:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    # Find weak areas
+    knowledge_states = db.query(KnowledgeState).filter(
+        and_(
+            KnowledgeState.student_id == student_id,
+            KnowledgeState.mastery_level < 0.6
+        )
+    ).all()
+
+    if not knowledge_states:
+        return {
+            "student_id": student_id,
+            "message": "Great job! You're doing well in all areas. Keep practicing to maintain your skills.",
+            "tips": None
+        }
+
+    # Get main weak topic
+    weakest = min(knowledge_states, key=lambda x: x.mastery_level)
+    weak_topics = [ks.topic for ks in knowledge_states[:3]]  # Top 3 weak areas
+
+    try:
+        tips = groq_client.generate_study_tips(
+            topic=weakest.topic,
+            weak_areas=weak_topics
+        )
+
+        return {
+            "student_id": student_id,
+            "weak_areas": weak_topics,
+            "tips": tips
+        }
+    except Exception as e:
+        return {
+            "student_id": student_id,
+            "weak_areas": weak_topics,
+            "tips": f"Focus on practicing {', '.join(weak_topics)}. Review the fundamentals and try explaining concepts in your own words."
+        }
+
+@app.get("/api/knowledge-gaps")
+def analyze_knowledge_gaps(
+    db: Session = Depends(get_db),
+    current_student: Student = Depends(get_current_student)
+):
+    """
+    Analyze knowledge gaps using BKT model
+    """
+    # Get all knowledge states
+    knowledge_states = db.query(KnowledgeState).filter(
+        KnowledgeState.student_id == current_student.id
+    ).all()
+
+    if not knowledge_states:
+        return {
+            "student_id": current_student.id,
+            "gaps": [],
+            "message": "Start practicing to identify areas for improvement!"
+        }
+
+    # Convert to dict for BKT analysis
+    mastery_dict = {ks.topic: ks.mastery_level for ks in knowledge_states}
+
+    # Identify gaps using BKT
+    gaps = knowledge_tracker.identify_knowledge_gaps(mastery_dict, threshold=0.6)
+
+    return {
+        "student_id": current_student.id,
+        "gaps": gaps,
+        "total_gaps": len(gaps)
     }
