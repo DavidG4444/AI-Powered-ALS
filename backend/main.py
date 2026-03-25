@@ -2,12 +2,14 @@ from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
-from sqlalchemy import and_
+from sqlalchemy import and_, func, case, desc
 from utils.recommender import QuestionRecommender
 from ai.groq_client import groq_client
 from ml_models.knowledge_tracker import knowledge_tracker
 from ml_models.difficulty_adapter import difficulty_adapter
 from ml_models.learning_path import learning_path_generator
+from services.analytics_service import AnalyticsService
+from typing import Optional
 from datetime import timedelta
 from typing import Optional, List
 
@@ -233,7 +235,7 @@ def create_question(
 
     return new_question
 
-@app.get("/api/questions/next", response_model=List[QuestionForStudent])
+@app.get("/api/questions", response_model=List[QuestionForStudent])
 def get_questions(
     topic: str = 0,
     difficulty: int = 0,
@@ -803,4 +805,350 @@ def analyze_knowledge_gaps(
         "student_id": current_student.id,
         "gaps": gaps,
         "total_gaps": len(gaps)
+    }
+# ===== ANALYTICS ENDPOINTS =====
+
+@app.get("/api/analytics/student/{student_id}/overview")
+def get_student_analytics_overview(
+    student_id: int,
+    db: Session = Depends(get_db),
+    current_student: Student = Depends(get_current_student)
+):
+    """
+    Get comprehensive analytics overview for a student
+    """
+    # Authorization check
+    if current_student.id != student_id and not current_student.is_teacher:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    analytics = AnalyticsService(db)
+    overview = analytics.get_student_overview(student_id)
+
+    return overview
+
+@app.get("/api/analytics/student/{student_id}/progress")
+def get_student_progress(
+    student_id: int,
+    days: int = 30,
+    db: Session = Depends(get_db),
+    current_student: Student = Depends(get_current_student)
+):
+    """
+    Get daily progress data for visualization
+    """
+    if current_student.id != student_id and not current_student.is_teacher:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    analytics = AnalyticsService(db)
+    progress = analytics.get_progress_over_time(student_id, days)
+
+    return {
+        "student_id": student_id,
+        "days": days,
+        "data": progress
+    }
+
+@app.get("/api/analytics/student/{student_id}/topics")
+def get_student_topic_breakdown(
+    student_id: int,
+    db: Session = Depends(get_db),
+    current_student: Student = Depends(get_current_student)
+):
+    """
+    Get detailed performance breakdown by topic
+    """
+    if current_student.id != student_id and not current_student.is_teacher:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    analytics = AnalyticsService(db)
+    topics = analytics.get_topic_breakdown(student_id)
+
+    return {
+        "student_id": student_id,
+        "topics": topics
+    }
+
+@app.get("/api/analytics/student/{student_id}/difficulty")
+def get_performance_by_difficulty(
+    student_id: int,
+    db: Session = Depends(get_db),
+    current_student: Student = Depends(get_current_student)
+):
+    """
+    Analyze performance across difficulty levels
+    """
+    if current_student.id != student_id and not current_student.is_teacher:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    analytics = AnalyticsService(db)
+    difficulty_stats = analytics.get_performance_by_difficulty(student_id)
+
+    return {
+        "student_id": student_id,
+        "difficulty_analysis": difficulty_stats
+    }
+
+@app.get("/api/analytics/student/{student_id}/comparison")
+def compare_to_class(
+    student_id: int,
+    db: Session = Depends(get_db),
+    current_student: Student = Depends(get_current_student)
+):
+    """
+    Compare student performance to class average
+    """
+    if current_student.id != student_id and not current_student.is_teacher:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    analytics = AnalyticsService(db)
+    comparison = analytics.compare_student_to_class(student_id)
+
+    return comparison
+
+@app.get("/api/analytics/student/{student_id}/trends")
+def get_improvement_trends(
+    student_id: int,
+    days: int = 14,
+    db: Session = Depends(get_db),
+    current_student: Student = Depends(get_current_student)
+):
+    """
+    Analyze improvement trends
+    """
+    if current_student.id != student_id and not current_student.is_teacher:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    analytics = AnalyticsService(db)
+    trends = analytics.get_improvement_trends(student_id, days)
+
+    return trends
+
+# ===== TEACHER DASHBOARD ENDPOINTS =====
+
+@app.get("/api/teacher/dashboard")
+def get_teacher_dashboard(
+    db: Session = Depends(get_db),
+    current_student: Student = Depends(get_current_student)
+):
+    """
+    Get complete teacher dashboard data
+
+    Requires teacher privileges
+    """
+    if not current_student.is_teacher:
+        raise HTTPException(
+            status_code=403,
+            detail="Teacher access required"
+        )
+
+    analytics = AnalyticsService(db)
+
+    return {
+        "class_overview": analytics.get_class_overview(),
+        "struggling_students": analytics.get_struggling_students(mastery_threshold=0.4, min_attempts=5)[:10],
+        "inactive_students": analytics.get_inactive_students(days=7)[:10],
+        "topic_difficulty": analytics.get_topic_difficulty_analysis()
+    }
+
+@app.get("/api/teacher/struggling-students")
+def get_struggling_students(
+    mastery_threshold: float = 0.4,
+    min_attempts: int = 5,
+    db: Session = Depends(get_db),
+    current_student: Student = Depends(get_current_student)
+):
+    """
+    Get list of students who need help
+    """
+    if not current_student.is_teacher:
+        raise HTTPException(status_code=403, detail="Teacher access required")
+
+    analytics = AnalyticsService(db)
+    struggling = analytics.get_struggling_students(mastery_threshold, min_attempts)
+
+    return {
+        "threshold": mastery_threshold,
+        "min_attempts": min_attempts,
+        "students": struggling,
+        "total_struggling": len(struggling)
+    }
+
+@app.get("/api/teacher/inactive-students")
+def get_inactive_students(
+    days: int = 7,
+    db: Session = Depends(get_db),
+    current_student: Student = Depends(get_current_student)
+):
+    """
+    Find students who haven't practiced recently
+    """
+    if not current_student.is_teacher:
+        raise HTTPException(status_code=403, detail="Teacher access required")
+
+    analytics = AnalyticsService(db)
+    inactive = analytics.get_inactive_students(days)
+
+    return {
+        "days_threshold": days,
+        "inactive_students": inactive,
+        "total_inactive": len(inactive)
+    }
+
+@app.get("/api/teacher/topic-analysis")
+def get_topic_difficulty_analysis(
+    db: Session = Depends(get_db),
+    current_student: Student = Depends(get_current_student)
+):
+    """
+    Analyze which topics are hardest for the class
+    """
+    if not current_student.is_teacher:
+        raise HTTPException(status_code=403, detail="Teacher access required")
+
+    analytics = AnalyticsService(db)
+    topics = analytics.get_topic_difficulty_analysis()
+
+    return {
+        "topics": topics,
+        "total_topics": len(topics)
+    }
+
+@app.get("/api/teacher/common-mistakes")
+def get_common_mistakes(
+    topic: Optional[str] = None,
+    limit: int = 10,
+    db: Session = Depends(get_db),
+    current_student: Student = Depends(get_current_student)
+):
+    """
+    Find most common mistakes students make
+    """
+    if not current_student.is_teacher:
+        raise HTTPException(status_code=403, detail="Teacher access required")
+
+    analytics = AnalyticsService(db)
+    mistakes = analytics.get_common_mistakes(topic, limit)
+
+    return {
+        "topic_filter": topic,
+        "common_mistakes": mistakes,
+        "total": len(mistakes)
+    }
+
+@app.get("/api/teacher/class-overview")
+def get_class_overview(
+    db: Session = Depends(get_db),
+    current_student: Student = Depends(get_current_student)
+):
+    """
+    Get overall class statistics
+    """
+    if not current_student.is_teacher:
+        raise HTTPException(status_code=403, detail="Teacher access required")
+
+    analytics = AnalyticsService(db)
+    overview = analytics.get_class_overview()
+
+    return overview
+
+# ===== LEADERBOARD ENDPOINT =====
+
+@app.get("/api/leaderboard")
+def get_leaderboard(
+    limit: int = 10,
+    metric: str = "accuracy",  # "accuracy", "mastery", "questions"
+    db: Session = Depends(get_db),
+    current_student: Student = Depends(get_current_student)
+):
+    """
+    Get leaderboard rankings
+
+    Metrics:
+    - accuracy: Overall accuracy percentage
+    - mastery: Average mastery across topics
+    - questions: Total questions answered
+    """
+    if metric == "accuracy":
+        # Rank by accuracy
+        leaderboard_query = db.query(
+            Student.id,
+            Student.username,
+            func.count(Interaction.id).label('total_questions'),
+            func.sum(case((Interaction.is_correct == True, 1), else_=0)).label('correct'),
+            (func.sum(case((Interaction.is_correct == True, 1.0), else_=0.0)) /
+             func.count(Interaction.id) * 100).label('accuracy')
+        ).join(
+            Interaction, Interaction.student_id == Student.id
+        ).group_by(
+            Student.id,
+            Student.username
+        ).having(
+            func.count(Interaction.id) >= 10  # Minimum 10 questions
+        ).order_by(
+            desc('accuracy')
+        ).limit(limit)
+
+    elif metric == "mastery":
+        # Rank by average mastery
+        leaderboard_query = db.query(
+            Student.id,
+            Student.username,
+            func.count(KnowledgeState.id).label('topics_count'),
+            func.avg(KnowledgeState.mastery_level).label('avg_mastery')
+        ).join(
+            KnowledgeState, KnowledgeState.student_id == Student.id
+        ).group_by(
+            Student.id,
+            Student.username
+        ).order_by(
+            desc('avg_mastery')
+        ).limit(limit)
+
+    else:  # questions
+        # Rank by total questions
+        leaderboard_query = db.query(
+            Student.id,
+            Student.username,
+            func.count(Interaction.id).label('total_questions')
+        ).join(
+            Interaction, Interaction.student_id == Student.id
+        ).group_by(
+            Student.id,
+            Student.username
+        ).order_by(
+            desc('total_questions')
+        ).limit(limit)
+
+    results = leaderboard_query.all()
+
+    leaderboard = []
+    for rank, student in enumerate(results, 1):
+        if metric == "accuracy":
+            leaderboard.append({
+                "rank": rank,
+                "student_id": student.id,
+                "username": student.username,
+                "total_questions": student.total_questions,
+                "correct": student.correct,
+                "accuracy": round(student.accuracy, 2)
+            })
+        elif metric == "mastery":
+            leaderboard.append({
+                "rank": rank,
+                "student_id": student.id,
+                "username": student.username,
+                "topics_count": student.topics_count,
+                "avg_mastery": round(student.avg_mastery, 2)
+            })
+        else:
+            leaderboard.append({
+                "rank": rank,
+                "student_id": student.id,
+                "username": student.username,
+                "total_questions": student.total_questions
+            })
+
+    return {
+        "metric": metric,
+        "leaderboard": leaderboard
     }
